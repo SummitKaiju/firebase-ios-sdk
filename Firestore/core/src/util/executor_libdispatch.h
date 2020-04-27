@@ -22,6 +22,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <functional>
 #include <memory>
+#include <mutex>  // NOLINT(build/c++11)
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -80,10 +81,15 @@ class ExecutorLibdispatch : public Executor {
   }
 
  private:
+  friend class TimeSlot;
+
   using ScheduleMap = std::unordered_map<Id, TimeSlot*>;
   using ScheduleEntry = ScheduleMap::value_type;
 
+  void TryCancelLocked(Id operation_id);
   Id NextId();
+
+  mutable std::mutex mutex_;
 
   dispatch_queue_t dispatch_queue_;
   // Stores non-owned pointers to `TimeSlot`s.

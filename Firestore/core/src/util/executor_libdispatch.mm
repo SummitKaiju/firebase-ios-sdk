@@ -16,6 +16,7 @@
 
 #include "Firestore/core/src/util/executor_libdispatch.h"
 
+#include <algorithm>
 #include <atomic>
 
 #include "Firestore/core/src/util/hard_assert.h"
@@ -78,15 +79,6 @@ namespace {
 
 using internal::DispatchAsync;
 using internal::DispatchSync;
-
-template <typename Work>
-void RunSynchronized(const ExecutorLibdispatch* const executor, Work&& work) {
-  if (executor->IsCurrentExecutor()) {
-    work();
-  } else {
-    DispatchSync(executor->dispatch_queue(), std::forward<Work>(work));
-  }
-}
 
 }  // namespace
 
@@ -208,7 +200,7 @@ void TimeSlot::Execute() {
 }
 
 void TimeSlot::RemoveFromSchedule() {
-  executor_->TryCancel(time_slot_id_);
+  executor_->TryCancelLocked(time_slot_id_);
 }
 
 // MARK: - ExecutorLibdispatch
@@ -254,19 +246,21 @@ DelayedOperation ExecutorLibdispatch::Schedule(const Milliseconds delay,
       DISPATCH_TIME_NOW, chr::duration_cast<chr::nanoseconds>(delay).count());
 
   // Ownership is fully transferred to libdispatch -- because it's impossible
-  // to truly cancel work after it's been dispatched, libdispatch is
-  // guaranteed to outlive the executor, and it's possible for work to be
-  // invoked by libdispatch after the executor is destroyed. Executor only
-  // stores an observer pointer to the operation.
+  // to truly cancel work after it's been dispatched, libdispatch is guaranteed
+  // to outlive the executor, and it's possible for work to be invoked by
+  // libdispatch after the executor is destroyed. The Executor only stores an
+  // observer pointer to the operation.
   TimeSlot* time_slot = nullptr;
   Id time_slot_id = 0;
-  RunSynchronized(this, [this, delay, &operation, &time_slot, &time_slot_id] {
-    time_slot_id = NextId();
-    time_slot = new TimeSlot{this, delay, std::move(operation), time_slot_id};
-    schedule_[time_slot_id] = time_slot;
-  });
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  dispatch_after_f(delay_ns, dispatch_queue(), time_slot,
+    time_slot_id = NextId();
+    time_slot = new TimeSlot(this, delay, std::move(operation), time_slot_id);
+    schedule_[time_slot_id] = time_slot;
+  }
+
+  dispatch_after_f(delay_ns, dispatch_queue_, time_slot,
                    TimeSlot::InvokedByLibdispatch);
 
   return DelayedOperation(this, time_slot_id);
@@ -277,50 +271,51 @@ void ExecutorLibdispatch::TryCancel(Id to_remove) {
   // runs, in which case it's guaranteed to have been removed from the
   // `schedule_`. If the `time_slot_id` refers to a slot that has been
   // removed, the call to `RemoveFromSchedule` will be a no-op.
-  RunSynchronized(this, [this, to_remove] {
-    const auto found = schedule_.find(to_remove);
+  std::lock_guard<std::mutex> lock(mutex_);
+  TryCancelLocked(to_remove);
+}
 
-    // It's possible for the operation to be missing if libdispatch gets to run
-    // it after it was force-run, for example.
-    if (found != schedule_.end()) {
-      found->second->MarkDone();
-      schedule_.erase(found);
-    }
-  });
+void ExecutorLibdispatch::TryCancelLocked(Id to_remove) {
+  // `time_slot` might have been destroyed by the time cancellation function
+  // runs, in which case it's guaranteed to have been removed from the
+  // `schedule_`. If the `time_slot_id` refers to a slot that has been
+  // removed, the call to `RemoveFromSchedule` will be a no-op.
+  const auto found = schedule_.find(to_remove);
+
+  // It's possible for the operation to be missing if libdispatch gets to run
+  // it after it was force-run, for example.
+  if (found != schedule_.end()) {
+    found->second->MarkDone();
+    schedule_.erase(found);
+  }
 }
 
 // Test-only methods
 
 bool ExecutorLibdispatch::IsScheduled(const Tag tag) const {
-  bool result = false;
-  RunSynchronized(this, [this, tag, &result] {
-    result = std::any_of(schedule_.begin(), schedule_.end(),
-                         [&tag](const ScheduleEntry& operation) {
-                           return *operation.second == tag;
-                         });
-  });
-  return result;
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  return std::any_of(schedule_.begin(), schedule_.end(),
+                     [&tag](const ScheduleEntry& operation) {
+                       return *operation.second == tag;
+                     });
 }
 
 absl::optional<Executor::TaggedOperation>
 ExecutorLibdispatch::PopFromSchedule() {
-  absl::optional<Executor::TaggedOperation> result;
+  std::lock_guard<std::mutex> lock(mutex_);
 
-  RunSynchronized(this, [this, &result]() -> void {
-    if (schedule_.empty()) {
-      return;
-    }
+  if (schedule_.empty()) {
+    return absl::nullopt;
+  }
 
-    const auto nearest = std::min_element(
-        schedule_.begin(), schedule_.end(),
-        [](const ScheduleEntry& lhs, const ScheduleEntry& rhs) {
-          return *lhs.second < *rhs.second;
-        });
+  const auto nearest =
+      std::min_element(schedule_.begin(), schedule_.end(),
+                       [](const ScheduleEntry& lhs, const ScheduleEntry& rhs) {
+                         return *lhs.second < *rhs.second;
+                       });
 
-    result = nearest->second->Unschedule();
-  });
-
-  return result;
+  return nearest->second->Unschedule();
 }
 
 ExecutorLibdispatch::Id ExecutorLibdispatch::NextId() {
