@@ -98,6 +98,10 @@ class Executor {
   virtual DelayedOperation Schedule(Milliseconds delay,
                                     TaggedOperation&& operation) = 0;
 
+  // If the operation hasn't yet been run, it will be removed from the queue.
+  // Otherwise, this function is a no-op.
+  virtual void TryCancel(Id operation_id) = 0;
+
   // Checks for the caller whether it is being invoked by this executor.
   virtual bool IsCurrentExecutor() const = 0;
   // Returns some sort of an identifier for the current execution context. The
@@ -130,25 +134,27 @@ class DelayedOperation {
   // Returns whether this `DelayedOperation` is associated with an actual
   // operation.
   explicit operator bool() const {
-    return static_cast<bool>(cancel_func_);
+    return !canceled_;
   }
 
   // If the operation has not been run yet, cancels the operation. Otherwise,
   // this function is a no-op.
   void Cancel() {
-    if (cancel_func_) {
-      cancel_func_();
-      cancel_func_ = {};
+    if (!canceled_) {
+      canceled_ = true;
+      executor_->TryCancel(id_);
     }
   }
 
   // Internal use only.
-  explicit DelayedOperation(std::function<void()>&& cancel_func)
-      : cancel_func_{std::move(cancel_func)} {
+  explicit DelayedOperation(Executor* executor, Executor::Id id)
+      : executor_(executor), id_(id), canceled_(false) {
   }
 
  private:
-  std::function<void()> cancel_func_;
+  Executor* executor_;
+  Executor::Id id_;
+  bool canceled_ = true;
 };
 
 }  // namespace util

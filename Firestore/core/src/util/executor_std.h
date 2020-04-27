@@ -229,9 +229,7 @@ class ExecutorStd : public Executor {
 
   using TimePoint = async::Schedule<Operation>::TimePoint;
 
-  // If the operation hasn't yet been run, it will be removed from the queue.
-  // Otherwise, this function is a no-op.
-  void TryCancel(Id operation_id);
+  void TryCancel(Id operation_id) override;
 
   Id PushOnSchedule(Operation&& operation, TimePoint when, Tag tag = -1);
 
