@@ -56,10 +56,10 @@ class Schedule {
   //   due;
   // - each operation modifying the queue notifies the condition variable `cv_`.
  public:
-  using Duration = std::chrono::milliseconds;
-  using Clock = std::chrono::steady_clock;
+  using Duration = Executor::Milliseconds;
+  using Clock = Executor::Clock;
   // Entries are scheduled using absolute time.
-  using TimePoint = std::chrono::time_point<Clock, Duration>;
+  using TimePoint = Executor::TimePoint;
 
   // Schedules an entry for the specified time due. `due` may be in the past.
   void Push(const T& value, const TimePoint due) {
@@ -226,8 +226,6 @@ class ExecutorStd : public Executor {
 
   bool IsScheduled(Tag tag) const override;
   absl::optional<TaggedOperation> PopFromSchedule() override;
-
-  using TimePoint = async::Schedule<Operation>::TimePoint;
 
   void TryCancel(Id operation_id) override;
 
