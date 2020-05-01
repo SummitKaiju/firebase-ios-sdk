@@ -57,7 +57,8 @@ class ExecutorLibdispatch : public Executor {
   void Execute(Operation&& operation) override;
   void ExecuteBlocking(Operation&& operation) override;
   DelayedOperation Schedule(Milliseconds delay,
-                            TaggedOperation&& operation) override;
+                            Tag tag,
+                            Operation&& operation) override;
 
   void TryCancel(Id operation_id) override;
 

@@ -100,7 +100,8 @@ class Executor {
   // `delay` must be non-negative; use `Execute` to schedule operations for
   // immediate execution.
   virtual DelayedOperation Schedule(Milliseconds delay,
-                                    TaggedOperation&& operation) = 0;
+                                    Tag tag,
+                                    Operation&& operation) = 0;
 
   // If the operation hasn't yet been run, it will be removed from the queue.
   // Otherwise, this function is a no-op.
