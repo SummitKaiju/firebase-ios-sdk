@@ -115,7 +115,13 @@ class TimeSlot {
 
   // Returns the operation that was scheduled for this time slot and turns the
   // slot into a no-op.
-  Executor::TaggedOperation Unschedule();
+  Executor::TaggedOperation UnscheduleLocked();
+
+  void MarkDone() {
+    done_ = true;
+  }
+
+  static void InvokedByLibdispatch(void* raw_self);
 
   bool operator<(const TimeSlot& rhs) const {
     // Order by target time, then by the order in which entries were created.
@@ -132,15 +138,8 @@ class TimeSlot {
     return tagged_.tag == tag;
   }
 
-  void MarkDone() {
-    done_ = true;
-  }
-
-  static void InvokedByLibdispatch(void* raw_self);
-
  private:
   void Execute();
-  void RemoveFromSchedule();
 
   using TimePoint = std::chrono::time_point<std::chrono::steady_clock,
                                             Executor::Milliseconds>;
@@ -172,9 +171,9 @@ TimeSlot::TimeSlot(ExecutorLibdispatch* const executor,
   done_ = false;
 }
 
-Executor::TaggedOperation TimeSlot::Unschedule() {
+Executor::TaggedOperation TimeSlot::UnscheduleLocked() {
   if (!done_) {
-    RemoveFromSchedule();
+    executor_->TryCancelLocked(time_slot_id_);
   }
   return std::move(tagged_);
 }
@@ -192,15 +191,11 @@ void TimeSlot::Execute() {
     return;
   }
 
-  RemoveFromSchedule();
+  executor_->TryCancel(time_slot_id_);
 
   HARD_ASSERT(tagged_.operation,
               "TimeSlot contains an invalid function object");
   tagged_.operation();
-}
-
-void TimeSlot::RemoveFromSchedule() {
-  executor_->TryCancelLocked(time_slot_id_);
 }
 
 // MARK: - ExecutorLibdispatch
@@ -315,7 +310,7 @@ ExecutorLibdispatch::PopFromSchedule() {
                          return *lhs.second < *rhs.second;
                        });
 
-  return nearest->second->Unschedule();
+  return nearest->second->UnscheduleLocked();
 }
 
 ExecutorLibdispatch::Id ExecutorLibdispatch::NextId() {
