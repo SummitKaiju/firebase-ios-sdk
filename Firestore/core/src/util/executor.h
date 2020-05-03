@@ -21,15 +21,13 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <utility>
-
-#include "absl/types/optional.h"
 
 namespace firebase {
 namespace firestore {
 namespace util {
 
 class DelayedOperation;
+class Task;
 
 // An interface to a platform-specific executor of asynchronous operations
 // (called tasks on other platforms).
@@ -46,6 +44,8 @@ class Executor {
   // An opaque name for a kind of operation. All operations of the same type
   // should share a tag.
   using Tag = int;
+  static constexpr Tag kNoTag = -1;
+
   // An opaque, monotonically increasing identifier for each operation that does
   // not depend on their address. Where the `Tag` identifies the kind of
   // operation, the `Id` identifies the specific instance.
@@ -55,20 +55,6 @@ class Executor {
   using Milliseconds = std::chrono::milliseconds;
   using Clock = std::chrono::steady_clock;
   using TimePoint = std::chrono::time_point<Clock, Milliseconds>;
-
-  // Operations scheduled for future execution have an opaque tag. The value of
-  // the tag is ignored by the executor but can be used to find operations with
-  // a given tag after they are scheduled.
-  struct TaggedOperation {
-    TaggedOperation() = default;
-
-    TaggedOperation(const Tag tag, Operation&& operation)
-        : tag{tag}, operation{std::move(operation)} {
-    }
-
-    Tag tag = 0;
-    Operation operation;
-  };
 
   // Creates a new serial Executor of the platform-appropriate type, and gives
   // it the given label, if the implementation supports it.
@@ -92,20 +78,20 @@ class Executor {
   // Like `Execute`, but blocks until the `operation` finishes, consequently
   // draining immediate operations from the executor.
   virtual void ExecuteBlocking(Operation&& operation) = 0;
+
   // Scheduled the given `operation` to be executed after `delay` milliseconds
   // from now, and returns a handle that allows to cancel the operation
-  // (provided it hasn't been run already). The operation is tagged to allow
-  // retrieving it later.
+  // (provided it hasn't been run already).
+  //
+  // Operations scheduled for future execution have an opaque tag. The value of
+  // the tag is ignored by the executor but can be used to find operations with
+  // a given tag after they are scheduled.
   //
   // `delay` must be non-negative; use `Execute` to schedule operations for
   // immediate execution.
   virtual DelayedOperation Schedule(Milliseconds delay,
                                     Tag tag,
                                     Operation&& operation) = 0;
-
-  // If the operation hasn't yet been run, it will be removed from the queue.
-  // Otherwise, this function is a no-op.
-  virtual void TryCancel(Id operation_id) = 0;
 
   // Checks for the caller whether it is being invoked by this executor.
   virtual bool IsCurrentExecutor() const = 0;
@@ -120,12 +106,36 @@ class Executor {
   // Checks whether an operation tagged with the given `tag` is currently
   // scheduled for future execution.
   virtual bool IsScheduled(Tag tag) const = 0;
+  virtual bool IsTaskScheduled(Id id) const = 0;
+
   // Removes the nearest due scheduled operation from the schedule and returns
-  // it to the caller. This function may be used to reschedule operations.
-  // Immediate operations don't count; only operations scheduled for delayed
-  // execution may be removed. If no such operations are currently scheduled, an
-  // empty `optional` is returned.
-  virtual absl::optional<TaggedOperation> PopFromSchedule() = 0;
+  // it to the caller.
+  //
+  // Only operations scheduled for delayed execution can be removed with this
+  // method; immediate operations don't count. If no such operations are
+  // currently scheduled, `nullptr` is returned.
+  //
+  // The caller is responsible for either Executing or Canceling (and Releasing)
+  // the returned Task.
+  virtual Task* PopFromSchedule() = 0;
+
+ private:
+  // Mark a task completed, removing it from any internal schedule or tracking.
+  //
+  // Called by Task once it has completed execution. Implementations of
+  // `Complete` should not call back to the Task: it is responsible for marking
+  // itself completed.
+  virtual void Complete(Task* task) = 0;
+  friend class Task;
+
+  // If the operation hasn't yet been run, it will be removed from the queue.
+  // Otherwise, this function is a no-op.
+  //
+  // Called by `DelayedOperation` when its user calls `Cancel`. Implementations
+  // of `Cancel` should also `Dispose` the underlying `Task` to actually prevent
+  // execution.
+  virtual void Cancel(Id operation_id) = 0;
+  friend class DelayedOperation;
 };
 
 // A handle to an operation scheduled for future execution. The handle may
@@ -139,34 +149,26 @@ class DelayedOperation {
   // Returns whether this `DelayedOperation` is associated with an actual
   // operation.
   explicit operator bool() const {
-    return !canceled_;
+    return executor_ && executor_->IsTaskScheduled(id_);
   }
 
   // If the operation has not been run yet, cancels the operation. Otherwise,
   // this function is a no-op.
   void Cancel() {
-    if (!canceled_) {
-      canceled_ = true;
-      executor_->TryCancel(id_);
+    if (executor_) {
+      executor_->Cancel(id_);
     }
   }
 
   // Internal use only.
   explicit DelayedOperation(Executor* executor, Executor::Id id)
-      : executor_(executor), id_(id), canceled_(false) {
+      : executor_(executor), id_(id) {
   }
 
  private:
-  Executor* executor_;
-  Executor::Id id_;
-  bool canceled_ = true;
+  Executor* executor_ = nullptr;
+  Executor::Id id_ = 0;
 };
-
-inline Executor::TimePoint MakeTargetTime(Executor::Milliseconds delay) {
-  return std::chrono::time_point_cast<Executor::Milliseconds>(
-             Executor::Clock::now()) +
-         delay;
-}
 
 }  // namespace util
 }  // namespace firestore

@@ -147,13 +147,14 @@ TEST_P(AsyncQueueTest, CanCallCancelOnDelayedOperationAfterTheOperationHasRun) {
 
   DelayedOperation delayed_operation;
   queue->Enqueue([&] {
-    delayed_operation = queue->EnqueueAfterDelay(AsyncQueue::Milliseconds(10),
+    delayed_operation = queue->EnqueueAfterDelay(AsyncQueue::Milliseconds(1),
                                                  kTimerId1, ran.AsCallback());
     EXPECT_TRUE(queue->IsScheduled(kTimerId1));
   });
 
   Await(ran);
-  EXPECT_FALSE(queue->IsScheduled(kTimerId1));
+  bool scheduled = queue->IsScheduled(kTimerId1);
+  EXPECT_FALSE(scheduled);
   EXPECT_NO_THROW(delayed_operation.Cancel());
 }
 

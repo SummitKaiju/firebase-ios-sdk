@@ -20,6 +20,7 @@
 #include <memory>
 #include <sstream>
 
+#include "Firestore/core/src/util/task.h"
 #include "absl/memory/memory.h"
 
 namespace firebase {
@@ -40,8 +41,7 @@ std::string ThreadIdToString(const std::thread::id thread_id) {
 
 // MARK: - ExecutorStd
 
-ExecutorStd::ExecutorStd(int threads)
-    : shutting_down_(std::make_shared<std::atomic<bool>>()) {
+ExecutorStd::ExecutorStd(int threads) {
   HARD_ASSERT(threads > 0);
 
   // Somewhat counter-intuitively, constructor of `std::atomic` assigns the
@@ -50,26 +50,22 @@ ExecutorStd::ExecutorStd(int threads)
   // See [this thread](https://stackoverflow.com/questions/25609858) for context
   // on the constructor.
   current_id_ = 0;
-  *shutting_down_ = false;
+
   for (int i = 0; i < threads; ++i) {
     worker_thread_pool_.emplace_back(&ExecutorStd::PollingThread, this);
   }
 }
 
 ExecutorStd::~ExecutorStd() {
-  *shutting_down_ = true;
-
-  // Make sure the worker threads are not blocked, so that the call to `join`
-  // doesn't hang. It's not deterministic which thread will pick up an entry,
-  // so add an entry for each thread before attempting to join.
+  // The worker threads loop until they receive a `nullptr` Task. Enqueue one
+  // `nullptr` task for each worker to cause them to break.
   for (size_t i = 0; i < worker_thread_pool_.size(); ++i) {
-    UnblockQueue();
+    schedule_.Push(nullptr, Immediate());
   }
 
   for (std::thread& thread : worker_thread_pool_) {
     // If the current thread is running this destructor, we can't join the
-    // thread. Instead detach it and rely on PollingThread to notice that
-    // *shutting_down_ is now true.
+    // thread. Instead detach it and rely on PollingThread to exit cleanly.
     if (std::this_thread::get_id() == thread.get_id()) {
       thread.detach();
     } else {
@@ -95,9 +91,16 @@ DelayedOperation ExecutorStd::Schedule(const Milliseconds delay,
   return DelayedOperation(this, id);
 }
 
-void ExecutorStd::TryCancel(const Id operation_id) {
-  schedule_.RemoveIf(
-      [operation_id](const Entry& e) { return e.id == operation_id; });
+void ExecutorStd::Complete(Task*) {
+  // No-op in this implementation
+}
+
+void ExecutorStd::Cancel(const Id operation_id) {
+  auto removed = schedule_.RemoveIf(
+      [operation_id](Task* t) { return t->id() == operation_id; });
+  if (removed.has_value()) {
+    removed.value()->Release();
+  }
 }
 
 ExecutorStd::Id ExecutorStd::PushOnSchedule(const TimePoint when,
@@ -106,27 +109,18 @@ ExecutorStd::Id ExecutorStd::PushOnSchedule(const TimePoint when,
   // Note: operations scheduled for immediate execution don't actually need an
   // id. This could be tweaked to reuse the same id for all such operations.
   const auto id = NextId();
-  schedule_.Push(Entry(tag, id, std::move(operation)), when);
+  schedule_.Push(new Task(nullptr, when, tag, id, std::move(operation)), when);
   return id;
 }
 
 void ExecutorStd::PollingThread() {
-  // Keep a local shared_ptr here to ensure that the atomic pointed to by
-  // shutting_down_ remains valid even after the destruction of the executor.
-  std::shared_ptr<std::atomic<bool>> local_shutting_down = shutting_down_;
-  while (!*local_shutting_down) {
-    Entry entry = schedule_.PopBlocking();
-    if (entry.operation) {
-      entry.operation();
+  for (;;) {
+    Task* task = schedule_.PopBlocking();
+    if (task == nullptr) {
+      break;
     }
+    task->Execute();
   }
-}
-
-void ExecutorStd::UnblockQueue() {
-  // Put a no-op for immediate execution on the queue to ensure that
-  // `schedule_.PopBlocking` returns, and worker thread can notice that shutdown
-  // is in progress.
-  schedule_.Push(Entry(kNoTag, /*id=*/0, [] {}), Immediate());
 }
 
 ExecutorStd::Id ExecutorStd::NextId() {
@@ -169,17 +163,20 @@ void ExecutorStd::ExecuteBlocking(Operation&& operation) {
 }
 
 bool ExecutorStd::IsScheduled(const Tag tag) const {
-  return schedule_.Contains([&tag](const Entry& e) { return e.tag == tag; });
+  return schedule_.Contains([&tag](Task* t) { return t->tag() == tag; });
 }
 
-absl::optional<Executor::TaggedOperation> ExecutorStd::PopFromSchedule() {
-  auto removed =
-      schedule_.RemoveIf([](const Entry& e) { return !e.IsImmediate(); });
+bool ExecutorStd::IsTaskScheduled(const Id id) const {
+  return schedule_.Contains([&id](Task* t) { return t->id() == id; });
+}
+
+Task* ExecutorStd::PopFromSchedule() {
+  auto removed = schedule_.RemoveIf([](Task* t) { return !t->is_immediate(); });
   if (!removed.has_value()) {
-    return {};
+    return nullptr;
   }
-  Entry entry = std::move(removed).value();
-  return TaggedOperation(entry.tag, std::move(entry.operation));
+  Task* task = removed.value();
+  return task;
 }
 
 // MARK: - Executor

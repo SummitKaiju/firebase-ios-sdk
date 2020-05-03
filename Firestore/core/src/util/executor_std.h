@@ -36,6 +36,8 @@ namespace firebase {
 namespace firestore {
 namespace util {
 
+class Task;
+
 namespace async {
 
 // A thread-safe class similar to a priority queue where the entries are
@@ -211,8 +213,6 @@ class Schedule {
 // thread, using C++11 standard library functionality.
 class ExecutorStd : public Executor {
  public:
-  static constexpr Tag kNoTag = -1;
-
   explicit ExecutorStd(int threads);
   ~ExecutorStd();
 
@@ -228,15 +228,16 @@ class ExecutorStd : public Executor {
   std::string Name() const override;
 
   bool IsScheduled(Tag tag) const override;
-  absl::optional<TaggedOperation> PopFromSchedule() override;
-
-  void TryCancel(Id operation_id) override;
+  bool IsTaskScheduled(Id id) const override;
+  Task* PopFromSchedule() override;
 
  private:
   Id PushOnSchedule(TimePoint when, Tag tag, Operation&& operation);
 
+  void Complete(Task* task) override;
+  void Cancel(Id operation_id) override;
+
   void PollingThread();
-  void UnblockQueue();
   Id NextId();
 
   // As a convention, assign the epoch time to all operations scheduled for
@@ -248,30 +249,11 @@ class ExecutorStd : public Executor {
     return TimePoint{};
   }
 
-  struct Entry {
-    Entry() = default;
-
-    Entry(const ExecutorStd::Tag tag,
-          const ExecutorStd::Id id,
-          Operation&& operation)
-        : tag(tag), id(id), operation(std::move(operation)) {
-    }
-
-    bool IsImmediate() const {
-      return tag == kNoTag;
-    }
-
-    Tag tag = 0;
-    Id id = 0;
-    Operation operation;
-  };
   // Operations scheduled for immediate execution are also put on the schedule
   // (with due time set to `Immediate`).
-  async::Schedule<Entry> schedule_;
+  async::Schedule<Task*> schedule_;
 
   std::vector<std::thread> worker_thread_pool_;
-  // Used to stop the worker thread.
-  std::shared_ptr<std::atomic<bool>> shutting_down_;
 
   std::atomic<Id> current_id_{0};
 };
