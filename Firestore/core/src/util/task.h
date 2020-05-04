@@ -96,6 +96,10 @@ class Task {
     return tag_ == Executor::kNoTag;
   }
 
+  Executor::TimePoint target_time() const {
+    return target_time_;
+  }
+
   Executor::Tag tag() const {
     // tag_ is immutable; no locking required
     return tag_;

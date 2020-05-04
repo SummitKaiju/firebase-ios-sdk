@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 
+#include "Firestore/core/src/util/task.h"
 #include "Firestore/core/test/unit/testutil/async_testing.h"
 #include "Firestore/core/test/unit/testutil/time_testing.h"
 #include "Firestore/core/test/unit/util/executor_test.h"
@@ -34,7 +35,6 @@ namespace util {
 
 namespace chr = std::chrono;
 
-using async::Schedule;
 using testutil::kTimeout;
 using testutil::Now;
 
@@ -43,89 +43,114 @@ class ScheduleTest : public ::testing::Test, public testutil::AsyncTest {
   ScheduleTest() : start_time{Now()} {
   }
 
-  using ScheduleT = Schedule<int>;
+  Schedule schedule;
+  Schedule::TimePoint start_time;
 
-  ScheduleT schedule;
-  ScheduleT::TimePoint start_time;
+  void Push(int value, Schedule::TimePoint target_time) {
+    auto task = new Task(nullptr, target_time, value, UINT32_C(0), [] {});
+    schedule.Push(task);
+  }
+
+  int PopIfDue() {
+    return Value(schedule.PopIfDue());
+  }
+
+  int PopBlocking() {
+    return Value(schedule.PopBlocking());
+  }
+
+  int Value(Task* task) {
+    if (task) {
+      int result = task->tag();
+      task->Release();
+      return result;
+    } else {
+      return -1;
+    }
+  }
+
+ private:
+  int last_result_;
 };
 
 // Schedule tests
 
+#define ASSERT_NONE_DUE() ASSERT_EQ(schedule.PopIfDue(), nullptr)
+#define EXPECT_NONE_DUE() EXPECT_EQ(schedule.PopIfDue(), nullptr)
+
 TEST_F(ScheduleTest, PopIfDue_Immediate) {
-  EXPECT_FALSE(schedule.PopIfDue().has_value());
+  EXPECT_NONE_DUE();
 
   // Push values in a deliberately non-sorted order.
-  schedule.Push(3, start_time);
-  schedule.Push(1, start_time);
-  schedule.Push(2, start_time);
+  Push(3, start_time);
+  Push(1, start_time);
+  Push(2, start_time);
   EXPECT_FALSE(schedule.empty());
   EXPECT_EQ(schedule.size(), 3u);
 
-  EXPECT_EQ(schedule.PopIfDue().value(), 3);
-  EXPECT_EQ(schedule.PopIfDue().value(), 1);
-  EXPECT_EQ(schedule.PopIfDue().value(), 2);
-  EXPECT_FALSE(schedule.PopIfDue().has_value());
+  EXPECT_EQ(PopIfDue(), 3);
+  EXPECT_EQ(PopIfDue(), 1);
+  EXPECT_EQ(PopIfDue(), 2);
+  EXPECT_NONE_DUE();
   EXPECT_TRUE(schedule.empty());
   EXPECT_EQ(schedule.size(), 0u);
 }
 
 TEST_F(ScheduleTest, PopIfDue_Delayed) {
-  schedule.Push(1, start_time + chr::milliseconds(5));
-  schedule.Push(2, start_time + chr::milliseconds(3));
-  schedule.Push(3, start_time + chr::milliseconds(1));
+  Push(1, start_time + chr::milliseconds(5));
+  Push(2, start_time + chr::milliseconds(3));
+  Push(3, start_time + chr::milliseconds(1));
 
-  std::this_thread::sleep_for(chr::milliseconds(5));
+  SleepFor(5);
 
-  EXPECT_EQ(schedule.PopIfDue().value(), 3);
-  EXPECT_EQ(schedule.PopIfDue().value(), 2);
-  EXPECT_EQ(schedule.PopIfDue().value(), 1);
+  EXPECT_EQ(PopIfDue(), 3);
+  EXPECT_EQ(PopIfDue(), 2);
+  EXPECT_EQ(PopIfDue(), 1);
   EXPECT_TRUE(schedule.empty());
 }
 
 TEST_F(ScheduleTest, PopBlocking) {
-  schedule.Push(1, start_time + chr::milliseconds(3));
-  EXPECT_FALSE(schedule.PopIfDue().has_value());
+  Push(1, start_time + chr::milliseconds(3));
+  EXPECT_NONE_DUE();
 
-  EXPECT_EQ(schedule.PopBlocking(), 1);
+  EXPECT_EQ(PopBlocking(), 1);
   EXPECT_GE(Now(), start_time + chr::milliseconds(3));
   EXPECT_TRUE(schedule.empty());
 }
 
 TEST_F(ScheduleTest, RemoveIf) {
-  schedule.Push(1, start_time);
-  schedule.Push(2, Now() + chr::minutes(1));
+  Push(1, start_time);
+  Push(2, Now() + chr::minutes(1));
 
-  auto maybe_removed = schedule.RemoveIf([](const int v) { return v == 1; });
-  EXPECT_TRUE(maybe_removed.has_value());
-  EXPECT_EQ(maybe_removed.value(), 1);
+  auto maybe_removed = schedule.RemoveIf([](Task* t) { return t->tag() == 1; });
+  EXPECT_EQ(Value(maybe_removed), 1);
 
   // Non-existent value.
-  maybe_removed = schedule.RemoveIf([](const int v) { return v == 1; });
-  EXPECT_FALSE(maybe_removed.has_value());
+  maybe_removed = schedule.RemoveIf([](Task* t) { return t->tag() == 1; });
+  EXPECT_EQ(maybe_removed, nullptr);
 
-  maybe_removed = schedule.RemoveIf([](const int v) { return v == 2; });
-  EXPECT_TRUE(maybe_removed.has_value());
-  EXPECT_EQ(maybe_removed.value(), 2);
+  maybe_removed = schedule.RemoveIf([](Task* t) { return t->tag() == 2; });
+  EXPECT_EQ(Value(maybe_removed), 2);
   EXPECT_TRUE(schedule.empty());
 }
 
 TEST_F(ScheduleTest, Ordering) {
-  schedule.Push(11, start_time + chr::milliseconds(5));
-  schedule.Push(1, start_time);
-  schedule.Push(2, start_time);
-  schedule.Push(9, start_time + chr::milliseconds(2));
-  schedule.Push(3, start_time);
-  schedule.Push(10, start_time + chr::milliseconds(3));
-  schedule.Push(12, start_time + chr::milliseconds(5));
-  schedule.Push(4, start_time);
-  schedule.Push(5, start_time);
-  schedule.Push(6, start_time);
-  schedule.Push(8, start_time + chr::milliseconds(1));
-  schedule.Push(7, start_time);
+  Push(11, start_time + chr::milliseconds(5));
+  Push(1, start_time);
+  Push(2, start_time);
+  Push(9, start_time + chr::milliseconds(2));
+  Push(3, start_time);
+  Push(10, start_time + chr::milliseconds(3));
+  Push(12, start_time + chr::milliseconds(5));
+  Push(4, start_time);
+  Push(5, start_time);
+  Push(6, start_time);
+  Push(8, start_time + chr::milliseconds(1));
+  Push(7, start_time);
 
   std::vector<int> values;
   while (!schedule.empty()) {
-    values.push_back(schedule.PopBlocking());
+    values.push_back(PopBlocking());
   }
   const std::vector<int> expected = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
   EXPECT_EQ(values, expected);
@@ -133,86 +158,86 @@ TEST_F(ScheduleTest, Ordering) {
 
 TEST_F(ScheduleTest, AddingEntryUnblocksEmptyQueue) {
   const auto future = Async([&] {
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 1);
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 1);
   });
 
-  std::this_thread::sleep_for(chr::milliseconds(5));
-  schedule.Push(1, start_time);
+  SleepFor(5);
+  Push(1, start_time);
   Await(future);
 }
 
 TEST_F(ScheduleTest, PopBlockingUnblocksOnNewPastDueEntries) {
   const auto far_away = start_time + chr::seconds(10);
-  schedule.Push(5, far_away);
+  Push(5, far_away);
 
   const auto future = Async([&] {
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 3);
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 3);
   });
 
-  std::this_thread::sleep_for(chr::milliseconds(5));
-  schedule.Push(3, start_time);
+  SleepFor(5);
+  Push(3, start_time);
   Await(future);
 }
 
 TEST_F(ScheduleTest, PopBlockingAdjustsWaitTimeOnNewSoonerEntries) {
   const auto far_away = start_time + chr::seconds(10);
-  schedule.Push(5, far_away);
+  Push(5, far_away);
 
   const auto future = Async([&] {
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 3);
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 3);
     // Make sure schedule hasn't been waiting longer than necessary.
     EXPECT_LT(Now(), far_away);
   });
 
-  std::this_thread::sleep_for(chr::milliseconds(5));
-  schedule.Push(3, start_time + chr::milliseconds(100));
+  SleepFor(5);
+  Push(3, start_time + chr::milliseconds(100));
   Await(future);
 }
 
 TEST_F(ScheduleTest, PopBlockingCanReadjustTimeIfSeveralElementsAreAdded) {
   const auto far_away = start_time + chr::seconds(5);
   const auto very_far_away = start_time + chr::seconds(10);
-  schedule.Push(3, very_far_away);
+  Push(3, very_far_away);
 
   const auto future = Async([&] {
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 1);
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 1);
     EXPECT_LT(Now(), far_away);
   });
 
   SleepFor(5);
-  schedule.Push(2, far_away);
+  Push(2, far_away);
   SleepFor(1);
-  schedule.Push(1, start_time + chr::milliseconds(100));
+  Push(1, start_time + chr::milliseconds(100));
   Await(future);
 }
 
 TEST_F(ScheduleTest, PopBlockingNoticesRemovals) {
   const auto future = Async([&] {
-    schedule.Push(1, start_time + chr::milliseconds(50));
-    schedule.Push(2, start_time + chr::milliseconds(100));
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 2);
+    Push(1, start_time + chr::milliseconds(50));
+    Push(2, start_time + chr::milliseconds(100));
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 2);
   });
 
   while (schedule.empty()) {
     SleepFor(1);
   }
   const auto maybe_removed =
-      schedule.RemoveIf([](const int v) { return v == 1; });
-  EXPECT_EQ(maybe_removed.value(), 1);
+      schedule.RemoveIf([](Task* t) { return t->tag() == 1; });
+  EXPECT_EQ(Value(maybe_removed), 1);
   Await(future);
 }
 
 TEST_F(ScheduleTest, PopBlockingIsNotAffectedByIrrelevantRemovals) {
   const auto future = Async([&] {
-    schedule.Push(1, start_time + chr::milliseconds(50));
-    schedule.Push(2, start_time + chr::seconds(10));
-    ASSERT_FALSE(schedule.PopIfDue().has_value());
-    EXPECT_EQ(schedule.PopBlocking(), 1);
+    Push(1, start_time + chr::milliseconds(50));
+    Push(2, start_time + chr::seconds(10));
+    ASSERT_NONE_DUE();
+    EXPECT_EQ(PopBlocking(), 1);
   });
 
   // Wait (with timeout) for both values to appear in the schedule.
@@ -220,12 +245,11 @@ TEST_F(ScheduleTest, PopBlockingIsNotAffectedByIrrelevantRemovals) {
     if (Now() - start_time >= kTimeout) {
       FAIL() << "Timed out.";
     }
-    std::this_thread::sleep_for(chr::milliseconds(1));
+    SleepFor(1);
   }
   const auto maybe_removed =
-      schedule.RemoveIf([](const int v) { return v == 2; });
-  ASSERT_TRUE(maybe_removed.has_value());
-  EXPECT_EQ(maybe_removed.value(), 2);
+      schedule.RemoveIf([](Task* t) { return t->tag() == 2; });
+  EXPECT_EQ(Value(maybe_removed), 2);
   Await(future);
 }
 

@@ -29,6 +29,21 @@ namespace util {
 
 namespace {
 
+// As a convention, assign the epoch time to all operations scheduled for
+// immediate execution. Note that it means that an immediate operation is
+// always scheduled before any delayed operation, even in the corner case when
+// the immediate operation was scheduled after a delayed operation was due
+// (but hasn't yet run).
+Executor::TimePoint Immediate() {
+  return Executor::TimePoint{};
+}
+
+// The minimum time point, used to enqueue things at the absolute front of the
+// schedule.
+Executor::TimePoint Min() {
+  return Executor::TimePoint{Executor::TimePoint::duration::min()};
+}
+
 // The only guarantee is that different `thread_id`s will produce different
 // values.
 std::string ThreadIdToString(const std::thread::id thread_id) {
@@ -57,10 +72,10 @@ ExecutorStd::ExecutorStd(int threads) {
 }
 
 ExecutorStd::~ExecutorStd() {
-  // The worker threads loop until they receive a `nullptr` Task. Enqueue one
-  // `nullptr` task for each worker to cause them to break.
+  // The worker threads loop until they receive a Task with a kShutdownTag.
+  // Enqueue one such task for each worker to cause them to break.
   for (size_t i = 0; i < worker_thread_pool_.size(); ++i) {
-    schedule_.Push(nullptr, Immediate());
+    PushOnSchedule(Min(), kShutdownTag, [] {});
   }
 
   for (std::thread& thread : worker_thread_pool_) {
@@ -98,8 +113,8 @@ void ExecutorStd::Complete(Task*) {
 void ExecutorStd::Cancel(const Id operation_id) {
   auto removed = schedule_.RemoveIf(
       [operation_id](Task* t) { return t->id() == operation_id; });
-  if (removed.has_value()) {
-    removed.value()->Release();
+  if (removed) {
+    removed->Release();
   }
 }
 
@@ -109,16 +124,18 @@ ExecutorStd::Id ExecutorStd::PushOnSchedule(const TimePoint when,
   // Note: operations scheduled for immediate execution don't actually need an
   // id. This could be tweaked to reuse the same id for all such operations.
   const auto id = NextId();
-  schedule_.Push(new Task(nullptr, when, tag, id, std::move(operation)), when);
+  schedule_.Push(new Task(nullptr, when, tag, id, std::move(operation)));
   return id;
 }
 
 void ExecutorStd::PollingThread() {
   for (;;) {
     Task* task = schedule_.PopBlocking();
-    if (task == nullptr) {
+    if (task->tag() == kShutdownTag) {
+      task->Release();
       break;
     }
+
     task->Execute();
   }
 }
@@ -171,12 +188,7 @@ bool ExecutorStd::IsTaskScheduled(const Id id) const {
 }
 
 Task* ExecutorStd::PopFromSchedule() {
-  auto removed = schedule_.RemoveIf([](Task* t) { return !t->is_immediate(); });
-  if (!removed.has_value()) {
-    return nullptr;
-  }
-  Task* task = removed.value();
-  return task;
+  return schedule_.RemoveIf([](Task* t) { return !t->is_immediate(); });
 }
 
 // MARK: - Executor
