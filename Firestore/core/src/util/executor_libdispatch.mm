@@ -95,10 +95,7 @@ ExecutorLibdispatch::~ExecutorLibdispatch() {
   }
 
   for (Task* task : local_async_tasks) {
-    if (!task->is_immediate()) {
-      task->Cancel();
-    }
-    task->Await();
+    task->Cancel();
     task->Release();
   }
 }
