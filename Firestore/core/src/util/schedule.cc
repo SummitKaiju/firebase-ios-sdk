@@ -25,9 +25,17 @@ namespace firestore {
 namespace util {
 
 Schedule::~Schedule() {
-  for (Task* task : scheduled_) {
+  Clear();
+}
+
+void Schedule::Clear() {
+  std::lock_guard<std::mutex> lock{mutex_};
+
+  for (auto task : scheduled_) {
     task->Release();
   }
+
+  scheduled_.clear();
 }
 
 void Schedule::Push(Task* task) {

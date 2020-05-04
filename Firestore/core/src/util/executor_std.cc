@@ -72,8 +72,17 @@ ExecutorStd::ExecutorStd(int threads) {
 }
 
 ExecutorStd::~ExecutorStd() {
-  // The worker threads loop until they receive a Task with a kShutdownTag.
-  // Enqueue one such task for each worker to cause them to break.
+  schedule_.Clear();
+
+  // Enqueue one Task with the kShutdownTag for each worker. Workers will finish
+  // whatever task they're currently working on, execute this task, and then
+  // quit.
+  //
+  // Note that this destructor may be running on a thread managed by this
+  // Executor. This means that these tasks cannot be Awaited, though we do so
+  // indirectly by joining threads if possible. On the thread currently running
+  // this destructor, the kShutdownTag Task will execute after the destructor
+  // completes.
   for (size_t i = 0; i < worker_thread_pool_.size(); ++i) {
     PushOnSchedule(Min(), kShutdownTag, [] {});
   }
@@ -131,12 +140,12 @@ ExecutorStd::Id ExecutorStd::PushOnSchedule(const TimePoint when,
 void ExecutorStd::PollingThread() {
   for (;;) {
     Task* task = schedule_.PopBlocking();
-    if (task->tag() == kShutdownTag) {
-      task->Release();
-      break;
-    }
+    bool shutdown_requested = task->tag() == kShutdownTag;
 
     task->Execute();
+    if (shutdown_requested) {
+      break;
+    }
   }
 }
 

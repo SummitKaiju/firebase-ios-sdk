@@ -54,6 +54,9 @@ class Schedule {
 
   ~Schedule();
 
+  // Destroys all Tasks managed by the Schedule.
+  void Clear();
+
   // Schedules a task for it's specified target time.
   void Push(Task* task);
 
