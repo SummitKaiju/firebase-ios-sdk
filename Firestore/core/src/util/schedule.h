@@ -21,6 +21,7 @@
 #include <condition_variable>  // NOLINT(build/c++11)
 #include <deque>
 #include <mutex>  // NOLINT(build/c++11)
+#include <vector>
 
 #include "Firestore/core/src/util/executor.h"
 
@@ -54,7 +55,6 @@ class Schedule {
 
   ~Schedule();
 
-  // Destroys all Tasks managed by the Schedule.
   void Clear();
 
   // Schedules a task for it's specified target time.

@@ -20,6 +20,7 @@
 #include <condition_variable>  // NOLINT(build/c++11)
 #include <memory>
 #include <mutex>  // NOLINT(build/c++11)
+#include <thread>  // NOLINT(build/c++11)
 
 #include "Firestore/core/src/util/executor.h"
 
@@ -137,6 +138,7 @@ class Task {
   Executor::Id id_ = 0;
 
   Executor::Operation operation_;
+  std::thread::id executing_thread_;
 };
 
 /**

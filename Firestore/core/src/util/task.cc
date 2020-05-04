@@ -116,27 +116,24 @@ void Task::ReleaseAndUnlock() {
 }
 
 void Task::Execute() {
-  {
-    ReleasingLockGuard lock(this);
+  ReleasingLockGuard lock(this);
 
-    if (state_ == State::kInitial) {
-      state_ = State::kRunning;
+  if (state_ == State::kInitial) {
+    state_ = State::kRunning;
+    executing_thread_ = std::this_thread::get_id();
 
-      InverseLockGuard unlock(mutex_);
+    InverseLockGuard unlock(mutex_);
 
-      // Mark the operation complete before executing it to avoid a race with
-      // any task that attempts to acquire a lock on the Executor as a
-      // consequence of the operation executing.
-      if (executor_) {
-        executor_->Complete(this);
-      }
-      operation_();
-    }
-
-    state_ = State::kDone;
-    operation_ = {};
-    is_complete_.notify_all();
+    operation_();
   }
+
+  if (executor_) {
+    executor_->Complete(this);
+  }
+
+  state_ = State::kDone;
+  operation_ = {};
+  is_complete_.notify_all();
 }
 
 void Task::Await() {
@@ -155,17 +152,21 @@ void Task::Cancel() {
 
   if (state_ == State::kInitial) {
     state_ = State::kCanceled;
+    executor_ = nullptr;
     operation_ = {};
     is_complete_.notify_all();
 
   } else if (state_ == State::kRunning) {
-    AwaitLocked(lock);
+    auto this_thread = std::this_thread::get_id();
+    if (this_thread != executing_thread_) {
+      AwaitLocked(lock);
+    } else {
+      executor_ = nullptr;
+    }
 
   } else {
     // no-op; already kCanceled or kDone.
   }
-
-  executor_ = nullptr;
 }
 
 bool Task::operator<(const Task& rhs) const {

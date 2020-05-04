@@ -299,6 +299,53 @@ TEST_P(ExecutorTest, ConcurrentExecutorsWork) {
   ASSERT_EQ(0, countdown->count());
 }
 
+TEST_P(ExecutorTest, DestructorWaitsForExecutingTasks) {
+  Expectation running;
+  Expectation shutdown_started;
+
+  std::string result;
+
+  executor->Execute([&] {
+    result += "1";
+    running.Fulfill();
+
+    Await(shutdown_started);
+    result += "3";
+  });
+
+  Expectation shutdown_complete;
+  Async([&] {
+    result += "2";
+    Await(running);
+
+    shutdown_started.Fulfill();
+    executor.reset(nullptr);
+
+    result += "4";
+    shutdown_complete.Fulfill();
+  });
+
+  Await(shutdown_complete);
+  ASSERT_EQ(result, "1234");
+}
+
+TEST_P(ExecutorTest, DestructorAvoidsDeadlockWhenDeletingSelf) {
+  Expectation complete;
+
+  std::string result;
+
+  executor->Execute([&] {
+    result += "1";
+    executor.reset(nullptr);
+    result += "2";
+
+    complete.Fulfill();
+  });
+
+  Await(complete);
+  ASSERT_EQ(result, "12");
+}
+
 }  // namespace util
 }  // namespace firestore
 }  // namespace firebase

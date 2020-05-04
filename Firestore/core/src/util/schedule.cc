@@ -29,9 +29,7 @@ Schedule::~Schedule() {
 }
 
 void Schedule::Clear() {
-  std::lock_guard<std::mutex> lock{mutex_};
-
-  for (auto task : scheduled_) {
+  for (Task* task : scheduled_) {
     task->Release();
   }
 

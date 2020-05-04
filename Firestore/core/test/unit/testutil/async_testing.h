@@ -52,7 +52,7 @@ std::unique_ptr<util::Executor> ExecutorForTesting(const char* name);
  */
 std::shared_ptr<util::AsyncQueue> AsyncQueueForTesting();
 
-constexpr auto kTimeout = std::chrono::seconds(5);
+constexpr auto kTimeout = std::chrono::hours(5);
 
 /**
  * An expected outcome of an asynchronous test.

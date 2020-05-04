@@ -26,7 +26,6 @@
 namespace firebase {
 namespace firestore {
 namespace util {
-
 namespace {
 
 absl::string_view StringViewFromDispatchLabel(const char* const label) {
@@ -91,7 +90,6 @@ ExecutorLibdispatch::~ExecutorLibdispatch() {
     // All scheduled operations are also registered in `async_tasks_` so they
     // can be handled in a single loop below.
     local_async_tasks.swap(async_tasks_);
-    schedule_.clear();
   }
 
   for (Task* task : local_async_tasks) {
@@ -208,6 +206,7 @@ void ExecutorLibdispatch::Cancel(Id operation_id) {
 
   if (found_task) {
     found_task->Cancel();
+    found_task->Release();
   }
 }
 
