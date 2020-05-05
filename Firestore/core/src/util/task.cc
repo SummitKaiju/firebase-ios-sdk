@@ -25,21 +25,13 @@
 namespace firebase {
 namespace firestore {
 namespace util {
+namespace {
 
-class ReleasingLockGuard {
- public:
-  explicit ReleasingLockGuard(Task* task) : task_(task) {
-    task_->mutex_.lock();
-  }
-
-  ~ReleasingLockGuard() {
-    task_->ReleaseAndUnlock();
-  }
-
- private:
-  Task* task_ = nullptr;
-};
-
+/**
+ * The inverse of `std::lock_guard`: it unlocks in the constructor and locks in
+ * its destructor, providing a way to safely temporarily release a lock that has
+ * already been acquired in the current scope.
+ */
 class InverseLockGuard {
  public:
   explicit InverseLockGuard(std::mutex& mutex) : mutex_(mutex) {
@@ -55,24 +47,32 @@ class InverseLockGuard {
 };
 
 /**
- * Returns the initial reference count for a Task based on whether or not the
- * task shares ownership with the executor that created it.
- *
- * @param executor The executor that owns the Task, or `nullptr` if the Task
- *     owns itself.
- * @return The initial reference count value.
+ * A subclass of Task that effectively gives `std::make_shared` access to Task's
+ * protected constructor.
  */
-int InitialRefCount(Executor* executor) {
-  return executor ? 2 : 1;
+struct TaskCreator : public Task {
+  template <typename... Args>
+  explicit TaskCreator(Args&&... args) : Task(std::forward<Args>(args)...) {
+  }
+};
+
+}  // namespace
+
+std::shared_ptr<Task> Task::Create(Executor* executor,
+                                   Executor::Operation&& operation) {
+  return Create(executor, Executor::TimePoint(), Executor::kNoTag, UINT32_C(0),
+                std::move(operation));
 }
 
-Task::Task(Executor* executor, Executor::Operation&& operation)
-    : ref_count_(InitialRefCount(executor)),
-      executor_(executor),
-      target_time_(),  // immediate
-      tag_(Executor::kNoTag),
-      id_(UINT32_C(0)),
-      operation_(std::move(operation)) {
+std::shared_ptr<Task> Task::Create(Executor* executor,
+                                   Executor::TimePoint target_time,
+                                   Executor::Tag tag,
+                                   Executor::Id id,
+                                   Executor::Operation&& operation) {
+  auto task = std::make_shared<TaskCreator>(executor, target_time, tag, id,
+                                            std::move(operation));
+  task->self_ownership_ = task;
+  return task;
 }
 
 Task::Task(Executor* executor,
@@ -80,8 +80,7 @@ Task::Task(Executor* executor,
            Executor::Tag tag,
            Executor::Id id,
            Executor::Operation&& operation)
-    : ref_count_(InitialRefCount(executor)),
-      executor_(executor),
+    : executor_(executor),
       target_time_(target_time),
       tag_(tag),
       id_(id),
@@ -92,31 +91,13 @@ Task::Task(Executor* executor,
 // local state.
 Task::~Task() = default;
 
-void Task::Retain() {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  ref_count_++;
-}
-
 void Task::Release() {
-  ReleasingLockGuard lock(this);
-}
-
-void Task::ReleaseAndUnlock() {
-  ref_count_--;
-
-  HARD_ASSERT(ref_count_ >= 0);
-
-  bool should_delete = ref_count_ == 0;
-  mutex_.unlock();
-
-  if (should_delete) {
-    delete this;
-  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  self_ownership_.reset();
 }
 
 void Task::Execute() {
-  ReleasingLockGuard lock(this);
+  std::lock_guard<std::mutex> lock(mutex_);
 
   if (state_ == State::kInitial) {
     state_ = State::kRunning;
@@ -127,13 +108,15 @@ void Task::Execute() {
     operation_();
   }
 
+  state_ = State::kDone;
+  operation_ = {};
+
   if (executor_) {
     executor_->Complete(this);
   }
-
-  state_ = State::kDone;
-  operation_ = {};
   is_complete_.notify_all();
+
+  self_ownership_.reset();
 }
 
 void Task::Await() {
@@ -157,11 +140,13 @@ void Task::Cancel() {
     is_complete_.notify_all();
 
   } else if (state_ == State::kRunning) {
+    // Canceled tasks don't make any callbacks.
+    executor_ = nullptr;
+
+    // Avoid deadlocking if the current Task is triggering its own cancellation.
     auto this_thread = std::this_thread::get_id();
     if (this_thread != executing_thread_) {
       AwaitLocked(lock);
-    } else {
-      executor_ = nullptr;
     }
 
   } else {

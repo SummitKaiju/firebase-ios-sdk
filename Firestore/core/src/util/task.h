@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Google LLC
+ * Copyright 2020 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
 #include <condition_variable>  // NOLINT(build/c++11)
 #include <memory>
-#include <mutex>  // NOLINT(build/c++11)
+#include <mutex>   // NOLINT(build/c++11)
 #include <thread>  // NOLINT(build/c++11)
 
 #include "Firestore/core/src/util/executor.h"
@@ -31,8 +31,22 @@ namespace util {
 /**
  * A task for an Executor to execute, either synchronously or asynchronously,
  * either immediately or after some delay.
+ *
+ * Nominally Tasks are owned by an Executor, but Tasks are intended to be able
+ * to outlive their owner in some special cases:
+ *
+ *   * If the Executor implementation delegates to a system scheduling facility
+ *     that does not support cancellation, the Executor can `Cancel` the task
+ *     and release its ownership. When the system gets around to Executing the
+ *     Task, it will be a no-op.
+ *   * If the Executor is being destroyed from a Task owned by the Executor, the
+ *     Task naturally has to outlive the Executor.
+ *
+ * To support this, Task internally keeps a `shared_ptr` to itself--an
+ * intentional cycle that is broken either when the task Executes or is
+ * Released.
  */
-class Task {
+class Task : public std::enable_shared_from_this<Task> {
  public:
   /**
    * Constructs a new Task for immediate execution.
@@ -40,7 +54,8 @@ class Task {
    * @param executor The Executor that owns the Task.
    * @param operation The operation to perform.
    */
-  Task(Executor* executor, Executor::Operation&& operation);
+  static std::shared_ptr<Task> Create(Executor* executor,
+                                      Executor::Operation&& operation);
 
   /**
    * Constructs a new Task for delayed execution.
@@ -51,12 +66,20 @@ class Task {
    * @param id The number identifying the specific instance of the task.
    * @param operation The operation to perform.
    */
+  static std::shared_ptr<Task> Create(Executor* executor,
+                                      Executor::TimePoint target_time,
+                                      Executor::Tag tag,
+                                      Executor::Id id,
+                                      Executor::Operation&& operation);
+
+ protected:
   Task(Executor* executor,
        Executor::TimePoint target_time,
        Executor::Tag tag,
        Executor::Id id,
        Executor::Operation&& operation);
 
+ public:
   Task(const Task& other) = delete;
   Task(Task&& other) noexcept = delete;
 
@@ -65,49 +88,81 @@ class Task {
 
   ~Task();
 
-  /** Increment the reference count. */
-  void Retain();
-
-  /**
-   * Decrement the reference count. The object is deleted when the reference
-   * count goes to zero.
-   */
-  void Release();
-
   /**
    * Executes the operation if the Task has not already been executed or
-   * canceled. Regardless of whether or not the operation runs, decrements the
-   * reference count.
+   * canceled. Regardless of whether or not the operation runs, releases the
+   * task's ownership of itself.
    */
   void Execute();
 
   /**
-   * Waits until the task has completed.
+   * Releases the task's ownership of itself without executing the task.
+   */
+  void Release();
+
+  /**
+   * Waits until the task has completed execution or cancellation.
    */
   void Await();
 
   /**
-   * Cancels the task, marking it done, and otherwise preventing it from
-   * interacting with the rest of the system.
+   * Cancels the task. Tasks that have not yet started running will be prevented
+   * from running.
+   *
+   * If the task is currently executing while it is invoked, `Cancel` will await
+   * the completion of the Task. This makes `Cancel` safe to call in the
+   * destructor of an Executor: any currently executing tasks will extend the
+   * lifetime of the Executor.
+   *
+   * However, if the current task is triggering its own cancellation, `Cancel`
+   * will *not* wait because this would cause a deadlock. This makes it possible
+   * for a Task to destroy the Executor that owns it and is compatible with
+   * expectations that Task might have: after destroying the Executor it
+   * obviously cannot be referenced again.
+   *
+   * Task guarantees that by the time `Cancel` has returned, the task will make
+   * no callbacks to the owning executor. This ensures that Tasks that survive
+   * past the end of the executor's life do not use after free.
+   *
+   * Taken together, these properties make it such that the Executor can
+   * `Cancel` all pending tasks in its destructor and the right thing will
+   * happen:
+   *
+   *   * Tasks that haven't started yet won't run.
+   *   * Tasks that are currently running will extend the lifetime of the
+   *     Executor.
+   *   * Tasks that are destroying the Executor won't deadlock.
    */
   void Cancel();
 
+  /**
+   * Returns true if the Task is suitable for immediate execution. That is, it
+   * was created without a target time.
+   */
   bool is_immediate() const {
     // tag_ is immutable; no locking required
     return tag_ == Executor::kNoTag;
   }
 
+  /**
+   * Returns the target time for execution of the Task. If the task is immediate
+   * this will be a zero value in the past.
+   */
   Executor::TimePoint target_time() const {
+    // target_time_ is immutable; no locking required.
     return target_time_;
   }
 
+  /**
+   * Returns the tag supplied in the custructor or `Executor::kNoTag`.
+   */
   Executor::Tag tag() const {
-    // tag_ is immutable; no locking required
+    // tag_ is immutable; no locking required.
     return tag_;
   }
 
   Executor::Id id() const {
-    // id_ is immutable; no locking required
+    // id_ is immutable; no locking required.
     return id_;
   }
 
@@ -121,16 +176,14 @@ class Task {
     kDone,      // Has run and has finished running; cannot be canceled
   };
 
-  friend class ReleasingLockGuard;
-
   void AwaitLocked(std::unique_lock<std::mutex>& lock);
-  void ReleaseAndUnlock();
 
   std::mutex mutex_;
   std::condition_variable is_complete_;
   State state_ = State::kInitial;
 
-  int ref_count_ = 0;
+  // See class comments.
+  std::shared_ptr<Task> self_ownership_;
 
   Executor* executor_ = nullptr;
   Executor::TimePoint target_time_;

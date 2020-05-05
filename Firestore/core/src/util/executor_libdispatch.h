@@ -84,7 +84,7 @@ class ExecutorLibdispatch : public Executor {
 
   dispatch_queue_t dispatch_queue_;
 
-  std::unordered_set<Task*> async_tasks_;
+  std::unordered_map<Task*, std::shared_ptr<Task>> async_tasks_;
   ScheduleMap schedule_;
   Id current_id_ = 0;
 };

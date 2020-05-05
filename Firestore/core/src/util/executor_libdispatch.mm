@@ -92,10 +92,11 @@ ExecutorLibdispatch::~ExecutorLibdispatch() {
     local_async_tasks.swap(async_tasks_);
   }
 
-  for (Task* task : local_async_tasks) {
-    task->Cancel();
-    task->Release();
+  for (auto&& entry : local_async_tasks) {
+    entry.first->Cancel();
   }
+
+  local_async_tasks.clear();
 }
 
 bool ExecutorLibdispatch::IsCurrentExecutor() const {
@@ -109,15 +110,14 @@ std::string ExecutorLibdispatch::Name() const {
 }
 
 void ExecutorLibdispatch::Execute(Operation&& operation) {
-  // Dynamically allocate the function to make sure the object is valid by the
-  // time libdispatch gets to it.
-  auto task = new Task(this, std::move(operation));
+  auto task = Task::Create(this, std::move(operation));
+  Task* raw_task = task.get();
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    async_tasks_.insert(task);
+    async_tasks_.emplace(raw_task, std::move(task));
   }
 
-  dispatch_async_f(dispatch_queue_, task, InvokeAsync);
+  dispatch_async_f(dispatch_queue_, raw_task, InvokeAsync);
 }
 
 void ExecutorLibdispatch::ExecuteBlocking(Operation&& operation) {
@@ -125,13 +125,14 @@ void ExecutorLibdispatch::ExecuteBlocking(Operation&& operation) {
       GetCurrentQueueLabel() != GetQueueLabel(dispatch_queue_),
       "Calling DispatchSync on the current queue will lead to a deadlock.");
 
-  auto task = new Task(this, std::move(operation));
+  auto task = Task::Create(this, std::move(operation));
+  Task* raw_task = task.get();
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    async_tasks_.insert(task);
+    async_tasks_.emplace(raw_task, std::move(task));
   }
 
-  dispatch_sync_f(dispatch_queue_, task, InvokeSync);
+  dispatch_sync_f(dispatch_queue_, raw_task, InvokeSync);
 }
 
 DelayedOperation ExecutorLibdispatch::Schedule(Milliseconds delay,
@@ -146,46 +147,40 @@ DelayedOperation ExecutorLibdispatch::Schedule(Milliseconds delay,
   // to outlive the executor, and it's possible for work to be invoked by
   // libdispatch after the executor is destroyed. The Executor only stores an
   // observer pointer to the operation.
-  Task* task = nullptr;
+  Task* raw_task = nullptr;
   TimePoint target_time = MakeTargetTime(delay);
   Id id = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
     id = NextIdLocked();
-    task = new Task(this, target_time, tag, id, std::move(operation));
-    async_tasks_.insert(task);
-    schedule_[id] = task;
+    auto task = Task::Create(this, target_time, tag, id, std::move(operation));
+    raw_task = task.get();
+
+    schedule_.emplace(id, raw_task);
+    async_tasks_.emplace(raw_task, std::move(task));
   }
 
-  dispatch_after_f(delay_ns, dispatch_queue_, task, InvokeAsync);
+  dispatch_after_f(delay_ns, dispatch_queue_, raw_task, InvokeAsync);
 
   return DelayedOperation(this, id);
 }
 
 void ExecutorLibdispatch::Complete(Task* task) {
-  bool should_release = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(mutex_);
 
-    auto found = async_tasks_.find(task);
-    if (found != async_tasks_.end()) {
-      should_release = true;
-      async_tasks_.erase(found);
+  auto found = async_tasks_.find(task);
+  if (found != async_tasks_.end()) {
+    async_tasks_.erase(found);
 
-      if (!task->is_immediate()) {
-        schedule_.erase(task->id());
-      }
+    if (!task->is_immediate()) {
+      schedule_.erase(task->id());
     }
-  }
-
-  if (should_release) {
-    task->Release();
   }
 }
 
 void ExecutorLibdispatch::Cancel(Id operation_id) {
-  Task* found_task = nullptr;
+  std::shared_ptr<Task> found_task;
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -193,20 +188,23 @@ void ExecutorLibdispatch::Cancel(Id operation_id) {
     // runs, in which case it's guaranteed to have been removed from the
     // `schedule_`. If the `time_slot_id` refers to a slot that has been
     // removed, the call to `RemoveFromSchedule` will be a no-op.
-    const auto found = schedule_.find(operation_id);
+    const auto schedule_found = schedule_.find(operation_id);
 
     // It's possible for the operation to be missing if libdispatch gets to run
     // it after it was force-run, for example.
-    if (found != schedule_.end()) {
-      found_task = found->second;
-      async_tasks_.erase(found_task);
-      schedule_.erase(found);
+    if (schedule_found != schedule_.end()) {
+      Task* raw_found_task = schedule_found->second;
+
+      auto tasks_found = async_tasks_.find(raw_found_task);
+      found_task = tasks_found->second;
+
+      async_tasks_.erase(tasks_found);
+      schedule_.erase(schedule_found);
     }
   }
 
   if (found_task) {
     found_task->Cancel();
-    found_task->Release();
   }
 }
 
